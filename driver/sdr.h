@@ -88,7 +88,7 @@ union u16_byte2 {
 
 #define MAX_NUM_VIF 4
 
-#define LEN_PHY_HEADER 16
+#define LEN_PHY_HEADER 24
 #define LEN_PHY_CRC 4
 
 #define RING_ROOM_THRESHOLD 4

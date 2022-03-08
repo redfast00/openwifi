@@ -638,10 +638,15 @@ u32 calc_phy_header(u8 rate_hw_value, bool use_ht_rate, bool use_short_gi, u32 l
 	header_parity = gen_parity((len_msb << 16)| (b1<<8) | b0) ;
 	b2 = ( len_msb | (header_parity << 1) ) ;
 
-	memset(bytes,0,16);
-	bytes[0] = b0 ;
-	bytes[1] = b1 ; 
-    bytes[2] = b2;
+	memset(bytes,0,LEN_PHY_HEADER);
+	// hardware parameters
+	bytes[0+4] = b0;
+	bytes[1+4] = b1; 
+    bytes[2+4] = b2;
+	// on-air bytes
+	bytes[0] = b0;
+	bytes[1] = b1;
+	bytes[2] = b2;
 
 	// HT-mixed mode signal
 	if(use_ht_rate)
@@ -651,12 +656,20 @@ u32 calc_phy_header(u8 rate_hw_value, bool use_ht_rate, bool use_short_gi, u32 l
 		ht_sig2 = ht_sig2 | (gen_ht_sig_crc(ht_sig1 | ht_sig2 << 24) << 10);
 
 	    bytes[3]  = 1;
+		// HT hardware parameters
 	    bytes[8]  = (ht_sig1 & 0xFF);
 	    bytes[9]  = (ht_sig1 >> 8)  & 0xFF;
 	    bytes[10] = (ht_sig1 >> 16) & 0xFF;
 	    bytes[11] = (ht_sig2 & 0xFF);
 	    bytes[12] = (ht_sig2 >> 8)  & 0xFF;
 	    bytes[13] = (ht_sig2 >> 16) & 0xFF;
+		// HT on-air
+		bytes[8+8]  = (ht_sig1 & 0xFF);
+	    bytes[9+8]  = (ht_sig1 >> 8)  & 0xFF;
+	    bytes[10+8] = (ht_sig1 >> 16) & 0xFF;
+	    bytes[11+8] = (ht_sig2 & 0xFF);
+	    bytes[12+8] = (ht_sig2 >> 8)  & 0xFF;
+	    bytes[13+8] = (ht_sig2 >> 16) & 0xFF;
 
 		return(HT_SIG_RATE);
 	}
