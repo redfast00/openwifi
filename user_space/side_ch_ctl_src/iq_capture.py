@@ -110,6 +110,10 @@ while True:
 
         timestamp, iq_capture, agc_gain, rssi_half_db = parse_iq(iq, iq_len)
         print(timestamp)
+        # Save I/Q sample in the format used by the testbench simulator
+        with open("last_iq.sim.txt", "w") as sim_outfile:
+            for sample in iq_capture:
+                print(f'{round(sample.real)} {round(sample.imag)}', file=sim_outfile)
         display_iq(iq_capture, agc_gain, rssi_half_db)
 
     except KeyboardInterrupt:
