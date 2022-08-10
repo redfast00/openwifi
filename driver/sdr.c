@@ -651,11 +651,13 @@ u32 calc_phy_header(u8 rate_hw_value, bool use_ht_rate, bool use_short_gi, u32 l
 	// HT-mixed mode signal
 	if(use_ht_rate)
 	{
+		printk("Sending HT packet\n");
 		ht_sig1 = (HT_SIG_RATE & 0x7F) | ((ht_len << 8) & 0xFFFF00);
 		ht_sig2 = 0x04 | (use_short_gi << 7);
 		ht_sig2 = ht_sig2 | (gen_ht_sig_crc(ht_sig1 | ht_sig2 << 24) << 10);
 
 	    bytes[3]  = 1;
+		bytes[3+4]  =  1;
 		// HT hardware parameters
 	    bytes[8]  = (ht_sig1 & 0xFF);
 	    bytes[9]  = (ht_sig1 >> 8)  & 0xFF;
@@ -707,6 +709,10 @@ static void openwifi_tx(struct ieee80211_hw *dev,
 	__le16 frame_control,duration_id;
 	u32 dma_fifo_no_room_flag, hw_queue_len;
 	enum dma_status status;
+
+	int fuzz_phy_mode = 0;
+	u8 signal_field[6];
+	int timestamp_absolute_offset = skb_headroom(skb) - TIMESTAMP_OFFSET;
 	// static bool led_status=0;
 	// struct gpio_led_data *led_dat = cdev_to_gpio_led_data(priv->led[3]);
 
@@ -718,6 +724,30 @@ static void openwifi_tx(struct ieee80211_hw *dev,
 	// 		gpiod_set_value(led_dat->gpiod, led_status);
 	// 	}
 	// }
+
+	printk("TX [TIMESTAMP] : 0x%02x %02x %02x %02x %02x %02x %02x %02x", skb->head[timestamp_absolute_offset + 0], skb->head[timestamp_absolute_offset + 1], skb->head[timestamp_absolute_offset + 2], skb->head[timestamp_absolute_offset + 3], skb->head[timestamp_absolute_offset + 4], skb->head[timestamp_absolute_offset + 5], skb->head[timestamp_absolute_offset + 6], skb->head[timestamp_absolute_offset + 7]);
+
+	// determine fuzzing mode
+	if (skb->head[timestamp_absolute_offset + 6] == 0x00 && skb->head[timestamp_absolute_offset + 7] == 0x00)
+		printk("TX INJECTION MODE: NO PHY FUZZING");
+	else if (skb->head[timestamp_absolute_offset + 6] == 0xaa && skb->head[timestamp_absolute_offset + 7] == 0xaa)
+	{
+		printk("TX INJECTION MODE: LEGACY MODE");
+		fuzz_phy_mode = 1;
+		for(i=0; i < 3; i++)
+			signal_field[i] = skb->head[timestamp_absolute_offset + i];  
+	}
+	else if (skb->head[timestamp_absolute_offset + 6] == 0xbb && skb->head[timestamp_absolute_offset + 7] == 0xbb)
+	{
+		printk("TX INJECTION MODE: GREENFIELD/HT MODE");
+		fuzz_phy_mode = 2;
+		for(i=0; i < 6; i++)
+			signal_field[i] = skb->head[timestamp_absolute_offset + i]; 
+	}
+	else
+	{
+		printk("TX INJECTION MODE: ILLEGAL MODE => NO FUZZING");
+	}
 
 	if (test_mode==1){
 		printk("%s openwifi_tx: WARNING test_mode==1\n", sdr_compatible_str);
@@ -883,6 +913,34 @@ static void openwifi_tx(struct ieee80211_hw *dev,
 	skb_push( skb, LEN_PHY_HEADER );
 	rate_signal_value = calc_phy_header(rate_hw_value, use_ht_rate, use_short_gi, len_mac_pdu+LEN_PHY_CRC, skb->data); //fill the phy header
 
+	// --------------------------------------- PHY FUZZING ---------------------------------------
+
+	if (fuzz_phy_mode == 1)
+	{
+		printk("BEFORE INJECTING LEGACY SIGNAL FIELD");
+		printk("TX (before): 0x%02x %02x %02x", skb->data[0], skb->data[1], skb->data[2]);
+
+		for (i = 0; i < 3; i++)
+		{
+			skb->data[i] = signal_field[i];
+		}
+		printk("AFTER INJECTING LEGACY SIGNAL FIELD");
+		printk("TX (after): 0x%02x %02x %02x", skb->data[0], skb->data[1], skb->data[2]);
+	}
+	if (fuzz_phy_mode == 2)
+	{
+		printk("BEFORE INJECTING GREENFIELD/HT SIGNAL FIELD");
+		printk("TX (before): 0x%02x %02x %02x %02x %02x %02x", skb->data[GREENFIELD_OFFSET + 0], skb->data[GREENFIELD_OFFSET + 1], skb->data[GREENFIELD_OFFSET + 2], skb->data[GREENFIELD_OFFSET + 3], skb->data[GREENFIELD_OFFSET + 4], skb->data[GREENFIELD_OFFSET + 5]);
+		for (i = 0; i < 6; i++)
+		{
+			skb->data[GREENFIELD_OFFSET + i] = signal_field[i];
+		}
+		printk("AFTER INJECTING GREENFIELD/HT SIGNAL FIELD");
+		printk("TX (after): 0x%02x %02x %02x %02x %02x %02x", skb->data[GREENFIELD_OFFSET + 0], skb->data[GREENFIELD_OFFSET + 1], skb->data[GREENFIELD_OFFSET + 2], skb->data[GREENFIELD_OFFSET + 3], skb->data[GREENFIELD_OFFSET + 4], skb->data[GREENFIELD_OFFSET + 5]);
+	}
+
+	// --------------------------------------- END PHY FUZZING ---------------------------------------
+
 	//make sure dma length is integer times of DDC_NUM_BYTE_PER_DMA_SYMBOL
 	if (skb_tailroom(skb)<num_byte_pad) {
 		printk("%s openwifi_tx: WARNING sn %d skb_tailroom(skb)<num_byte_pad!\n", sdr_compatible_str, ring->bd_wr_idx);
@@ -931,7 +989,7 @@ static void openwifi_tx(struct ieee80211_hw *dev,
 
 	if ( (*(u32*)(&(skb->data[4]))) || ((*(u32*)(&(skb->data[12])))&0xFFFF0000) ) {
 		printk("%s openwifi_tx: WARNING 1 %d %08x %08x %08x %08x\n", sdr_compatible_str, num_byte_pad, *(u32*)(&(skb->data[12])), *(u32*)(&(skb->data[8])), *(u32*)(&(skb->data[4])), *(u32*)(&(skb->data[0])));
-		goto openwifi_tx_early_out_after_lock;
+		// goto openwifi_tx_early_out_after_lock;
 	}
 
 //-------------------------fire skb DMA to hardware----------------------------------

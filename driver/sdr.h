@@ -89,6 +89,9 @@ union u16_byte2 {
 #define MAX_NUM_VIF 4
 
 #define LEN_PHY_HEADER 24
+#define TIMESTAMP_OFFSET 20 // counting from the opposite direction 
+#define GREENFIELD_OFFSET 16
+
 #define LEN_PHY_CRC 4
 
 #define RING_ROOM_THRESHOLD 4

@@ -21,8 +21,20 @@
 // Thanks for contributions:
 // 2007-03-15 fixes to getopt_long code by Matteo Croce rootkit85@yahoo.it
 
+// Modified by: Thomas Schuddinck
+// Year: 2021-2022
+//
+// Modified by: Jasper Devreker
+// Year: 2021-2022
+
 #include "inject_80211.h"
 #include "radiotap.h"
+#include <stdbool.h>
+#include "signal_field_utilities.h"
+
+
+#define BUF_SIZE_MAX   (1536)
+#define BUF_SIZE_TOTAL (BUF_SIZE_MAX+1) // +1 in case the sprintf insert the last 0
 
 /* wifi bitrate to use in 500kHz units */
 static const u8 u8aRatesToUse[] = {
@@ -42,7 +54,7 @@ static const u8 u8aRadiotapHeader[] =
 	0x00, 0x00, // <-- radiotap version
 	0x1c, 0x00, // <- radiotap header length
 	0x6f, 0x08, 0x08, 0x00, // <-- bitmap
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // <-- timestamp
+	0x12, 0x34, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00, // <-- timestamp
 	0x00, // <-- flags (Offset +0x10)
 	0x6c, // <-- rate (0ffset +0x11)
 	0x71, 0x09, 0xc0, 0x00, // <-- channel
@@ -52,19 +64,42 @@ static const u8 u8aRadiotapHeader[] =
 	0x02, 0x00, 0x0f,  // <-- MCS
 };
 
+#define	OFFSET_TMSTMP 0x8
 #define	OFFSET_RATE 0x11
 #define MCS_OFFSET 0x19
 #define GI_OFFSET 0x1a
 #define MCS_RATE_OFFSET 0x1b
 
 /* IEEE80211 header */
-static const u8 ieee_hdr[] =
+static u8 ieee_hdr_data[] =
 {
-	0x08, 0x01, 0x00, 0x00,             // FC 0x0801. 0--subtype; 8--type&version; 01--toDS1 fromDS0 (data packet to DS)
+	0x08, 0x02, 0x00, 0x00,             // FC 0x0801. 0--subtype; 8--type&version; 02--toDS0 fromDS1 (data packet from DS to STA)
 	0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // BSSID/MAC of AP
 	0x66, 0x55, 0x44, 0x33, 0x22, 0x22, // Source address (STA)
 	0x66, 0x55, 0x44, 0x33, 0x22, 0x33, // Destination address (another STA under the same AP)
 	0x10, 0x86,                         // 0--fragment number; 0x861=2145--sequence number
+};
+
+static u8 ieee_hdr_mgmt[] =
+{
+	0x00, 0x00, 0x00, 0x00,             // FC 0x0000. 0--subtype; 0--type&version; 
+	0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // BSSID/MAC of AP
+	0x66, 0x55, 0x44, 0x33, 0x22, 0x22, // Source address (STA)
+	0x66, 0x55, 0x44, 0x33, 0x22, 0x33, // Destination address (another STA under the same AP)
+	0x10, 0x86,                         // 0--fragment number; 0x861=2145--sequence number
+};
+
+static u8 ieee_hdr_ack_cts[] =
+{
+	0xd4, 0x00, 0x00, 0x00,             // FC 0xd400. d--subtype; 4--type&version;
+	0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mac addr of the peer
+};
+
+static u8 ieee_hdr_rts[] =
+{
+	0xb4, 0x00, 0x00, 0x00,             // FC 0xb400. b--subtype; 4--type&version;
+	0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mac addr of the peer
+	0x66, 0x55, 0x44, 0x33, 0x22, 0x22, // mac addr of the peer
 };
 
 // Generate random string
@@ -97,15 +132,31 @@ void usage(void)
 {
 	printf(
 	    "(c)2006-2007 Andy Green <andy@warmcat.com>  Licensed under GPL2\n"
-		"(r)2020 Michael Tetemke Mehari <michael.mehari@ugent.be>"
+		"(r)2020 Michael Tetemke Mehari <michael.mehari@ugent.be>\n"
+		"(r)2022 Xianjun Jiao <xianjun.jiao@ugent.be>"
 	    "\n"
 	    "Usage: inject_80211 [options] <interface>\n\nOptions\n"
 	    "-m/--hw_mode <hardware operation mode> (a,g,n)\n"
 	    "-r/--rate_index <rate/MCS index> (0,1,2,3,4,5,6,7)\n"
+		"-t/--packet_type (m/c/d/r for management/control/data/reserved)\n"
+		"-e/--sub_type (hex value. example:\n"
+		"     8/A/B/C for Beacon/Disassociation/Authentication/Deauth, when packet_type m\n"
+		"     A/B/C/D for PS-Poll/RTS/CTS/ACK, when packet_type c\n"
+		"     0/1/2/8 for Data/Data+CF-Ack/Data+CF-Poll/QoS-Data, when packet_type d)\n"
+		"-a/--addr1 <the last byte of addr1 in hex>\n"
+		"-b/--addr2 <the last byte of addr2 in hex>\n"
 	    "-i/--sgi_flag (0,1)\n"
 	    "-n/--num_packets <number of packets>\n"
 	    "-s/--payload_size <payload size in bytes>\n"
 	    "-d/--delay <delay between packets in usec>\n"
+		"-c/--legacy_signal_field <hexadecimal representation of signal field for PHY fuzzing> (hex value. example:\n"
+		"     0xff2345\n"
+		"     WARNING: the signal field is 24 bits, or 3 bytes long, so the value can't be longer than that.\n"
+		"     if the value contains less than six hexadecimal digits, they will be supplemented with zeros at the front."
+	    "-f/--ht_signal_field <hexadecimal representation of signal field for PHY fuzzing> (hex value. example\n"
+		"     0x112233445566\n"
+		"     SHOULD be 6 bytes long, only one of --legacy_signal_field and --ht_signal_field can be used"
+		"-d/--delay <delay between packets in usec>\n"
 	    "-h   this menu\n\n"
 
 	    "Example:\n"
@@ -113,15 +164,22 @@ void usage(void)
 	    "  inject_80211 mon0\n"
 	    "\n");
 	exit(1);
-}
+}   
 
 
 int main(int argc, char *argv[])
 {
-	u8 buffer[1536];
-	char szErrbuf[PCAP_ERRBUF_SIZE], rand_char[1484], hw_mode = 'n';
+	u8 buffer[BUF_SIZE_TOTAL], addr1=1, addr2=2, sub_type=1, *ieee_hdr;
+	char szErrbuf[PCAP_ERRBUF_SIZE], rand_char[1484], hw_mode = 'n', packet_type = 'd';
 	int i, nLinkEncap = 0, r, rate_index = 0, sgi_flag = 0, num_packets = 10, payload_size = 64, packet_size, nDelay = 100000;
+	int ieee_hdr_len, payload_len;
 	pcap_t *ppcap = NULL;
+
+	int fuzz_phy = 0; 
+	u8 signal_field[6];
+	u8 signal_u8_temp;
+	unsigned long int legacy_signal;
+	unsigned long long int ht_signal;
 
 	while (1)
 	{
@@ -130,14 +188,20 @@ int main(int argc, char *argv[])
 		{
 			{ "hw_mode", required_argument, NULL, 'm' },
 			{ "rate_index", required_argument, NULL, 'r' },
+			{ "packet_type", required_argument, NULL, 't' },
+			{ "sub_type", required_argument, NULL, 'e' },
+			{ "addr1", required_argument, NULL, 'a' },
+			{ "addr2", required_argument, NULL, 'b' },
 			{ "sgi_flag", no_argument, NULL, 'i' },
 			{ "num_packets", required_argument, NULL, 'n' },
 			{ "payload_size", required_argument, NULL, 's' },
 			{ "delay", required_argument, NULL, 'd' },
+			{ "legacy_signal_field", required_argument, NULL, 'c' },
+			{ "ht_signal_field", required_argument, NULL, 'f' },
 			{ "help", no_argument, &flagHelp, 1 },
 			{ 0, 0, 0, 0 }
 		};
-		int c = getopt_long(argc, argv, "m:r:i:n:s:d:h", optiona, &nOptionIndex);
+		int c = getopt_long(argc, argv, "m:r:t:e:a:b:i:n:s:d:c:f:h", optiona, &nOptionIndex);
 
 		if (c == -1)
 			break;
@@ -157,6 +221,22 @@ int main(int argc, char *argv[])
 				rate_index = atoi(optarg);
 				break;
 
+			case 't':
+				packet_type = optarg[0];
+				break;
+
+			case 'e':
+				sub_type = strtol(optarg, NULL, 16);
+				break;
+
+			case 'a':
+				addr1 = strtol(optarg, NULL, 16);
+				break;
+
+			case 'b':
+				addr2 = strtol(optarg, NULL, 16);
+				break;
+
 			case 'i':
 				sgi_flag = atoi(optarg);
 				break;
@@ -173,6 +253,40 @@ int main(int argc, char *argv[])
 				nDelay = atoi(optarg);
 				break;
 
+			case 'c':
+				if (fuzz_phy) {
+					usage();
+				}
+				legacy_signal = strtol(optarg, NULL, 0);
+				if(legacy_signal > (1<<24)){
+					usage();
+				} 
+				for(i = 2; i >= 0; i--){
+					signal_u8_temp = ((unsigned char) (legacy_signal & 0xff));
+					legacy_signal = legacy_signal >> 8;
+					signal_field[i] = signal_u8_temp;
+				}
+				fuzz_phy = 1;
+
+				break;
+			
+			case 'f':
+				if (fuzz_phy) {
+					usage();
+				}
+				ht_signal = strtoll(optarg, NULL, 0);
+				if(ht_signal > (1LL<<48)){
+					usage();
+				} 
+				for(i = 5; i >= 0; i--){
+					signal_u8_temp = ((unsigned char) (ht_signal & 0xff));
+					ht_signal = ht_signal >> 8;
+					signal_field[i] = signal_u8_temp;
+				}
+				fuzz_phy = 2;
+
+				break;
+
 			default:
 				printf("unknown switch %c\n", c);
 				usage();
@@ -182,7 +296,7 @@ int main(int argc, char *argv[])
 
 	if (optind >= argc)
 		usage();
-
+	
 	// open the interface in pcap
 	szErrbuf[0] = '\0';
 	ppcap = pcap_open_live(argv[optind], 800, 1, 20, szErrbuf);
@@ -210,10 +324,66 @@ int main(int argc, char *argv[])
 
 	pcap_setnonblock(ppcap, 1, szErrbuf);
 
+	// Fill the IEEE hdr
+	if (packet_type == 'd') // data packet
+	{
+		ieee_hdr_data[0]  = ( ieee_hdr_data[0]|(sub_type<<4) );
+		ieee_hdr_data[9]  = addr1;
+		ieee_hdr_data[15] = addr2;
+		ieee_hdr_len = sizeof(ieee_hdr_data);
+		ieee_hdr = ieee_hdr_data;
+	}
+	else if (packet_type == 'm') // managment packet
+	{
+		ieee_hdr_mgmt[0]  = ( ieee_hdr_mgmt[0]|(sub_type<<4) );
+		ieee_hdr_mgmt[9]  = addr1;
+		ieee_hdr_mgmt[15] = addr2;
+		ieee_hdr_len = sizeof(ieee_hdr_mgmt);
+		ieee_hdr = ieee_hdr_mgmt;
+	}
+	else if (packet_type == 'c')
+	{
+		payload_size = 0;
+		if (sub_type == 0xC || sub_type == 0xD)
+		{
+			ieee_hdr_ack_cts[0] = ( ieee_hdr_ack_cts[0]|(sub_type<<4) );
+			ieee_hdr_ack_cts[9] = addr1;
+			ieee_hdr_len = sizeof(ieee_hdr_ack_cts);
+			ieee_hdr = ieee_hdr_ack_cts;
+		} 
+		else if (sub_type == 0xA || sub_type == 0xB)
+		{
+			ieee_hdr_rts[0]  = ( ieee_hdr_rts[0]|(sub_type<<4) );
+			ieee_hdr_rts[9]  = addr1;
+			ieee_hdr_rts[15] = addr2;
+			ieee_hdr_len = sizeof(ieee_hdr_rts);
+			ieee_hdr = ieee_hdr_rts;
+		}
+		else
+		{
+			printf("!!! sub_type %x is not supported yet!\n", sub_type);
+			return (1);
+		}
+	} 
+	else 
+	{
+		printf("!!! packet_type %c is not supported yet!\n", packet_type);
+		return (1);
+	}
+
 	// Generate random string
-	gen_rand_str(payload_size, rand_char);
-	packet_size = sizeof(u8aRadiotapHeader) + sizeof(ieee_hdr) + strlen(rand_char);
-	printf("mode = 802.11%c, rate index = %d, SHORT GI = %d, number of packets = %d and packet size = %d bytes, delay = %d usec\n", hw_mode, rate_index, sgi_flag, num_packets, packet_size, nDelay);
+	gen_rand_str(payload_size+4, rand_char); //4 for space reserved for crc
+	payload_len = strlen(rand_char);
+	
+	packet_size = sizeof(u8aRadiotapHeader) + ieee_hdr_len + payload_len;
+
+	printf("\n\nmode = 802.11%c, rate index = %d, SHORT GI = %d, number of packets = %d and packet size = %d bytes, delay = %d usec\n", hw_mode, rate_index, sgi_flag, num_packets, packet_size, nDelay);
+	printf("packet_type %c sub_type %x payload_len %d ieee_hdr_len %d addr1 %02x addr2 %02x\n", packet_type, sub_type, payload_len, ieee_hdr_len, addr1, addr2);
+
+	if (packet_size > BUF_SIZE_MAX) {
+		printf("packet_size %d > %d! Quite\n", packet_size, BUF_SIZE_MAX);
+		return(1);
+	}
 
 	// Clear storage buffer
 	memset(buffer, 0, sizeof (buffer));
@@ -233,10 +403,37 @@ int main(int argc, char *argv[])
 			buffer[GI_OFFSET] = IEEE80211_RADIOTAP_MCS_SGI;
 		buffer[MCS_RATE_OFFSET] = rate_index;
 	}
+
+	printf("FUZZ PHY: %s\n", fuzz_phy ? "yes" : "no");
+	// inject signal field values in the timestamp field
+	
+	if (fuzz_phy == 1){
+		for(i = 0; i < 8; i++){
+			if(i < 3)
+				buffer[OFFSET_TMSTMP+i] = signal_field[i];
+			else
+				buffer[OFFSET_TMSTMP+i] = 0xaa;  
+		}
+	} else if (fuzz_phy == 2) {
+		for(i = 0; i < 8; i++){
+			if(i < 6)
+				buffer[OFFSET_TMSTMP+i] = signal_field[i];
+			else
+				buffer[OFFSET_TMSTMP+i] = 0xbb;  
+		}
+	}
+	
+	printf("Timestamp in hex:");
+	int t;
+	for(t=8; t< 16;t++){
+		printf(" x%02x", buffer[t]);
+	}
+	printf("\n");
+
 	// Insert IEEE DATA header
-	memcpy(buffer + sizeof(u8aRadiotapHeader), ieee_hdr, sizeof (ieee_hdr));
+	memcpy(buffer + sizeof(u8aRadiotapHeader), ieee_hdr, ieee_hdr_len);
 	// Insert IEEE DATA payload
-	sprintf((char *)(buffer + sizeof(u8aRadiotapHeader) + sizeof(ieee_hdr)), "%s", rand_char);
+	sprintf((char *)(buffer + sizeof(u8aRadiotapHeader) + ieee_hdr_len), "%s", rand_char);
 
 	// Inject packets
 	for(i = 1; i <= num_packets; i++)
@@ -247,7 +444,7 @@ int main(int argc, char *argv[])
 			return (1);
 		}
 
-		printf("number of packets sent = %d\r", i);
+		printf("number of packets sent = %d\n\r", i);
 		fflush(stdout);
 
 		if (nDelay)
